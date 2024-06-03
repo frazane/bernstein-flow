@@ -7,6 +7,7 @@ from jax.typing import ArrayLike
 import jax.numpy as jnp
 from jax.scipy.special import gammaln
 
+from tensorflow_probability.substrates.jax.bijectors import Softplus as SoftplusTFP
 
 class Bijector:
     """The base bijector class.
@@ -79,43 +80,66 @@ class Bernstein(Bijector):
         Args:
             thetas: A list of coefficients for the Bernstein polynomial.
         """
-        self.thetas = self.constrain_thetas(jnp.asarray(thetas))
-        self.order = thetas.shape[-1]
+        
+        self.thetas = jnp.asarray(thetas) if constrained else self.constrain_thetas(jnp.asarray(thetas))
+        self.order = self.thetas.shape[-1]  
         self.alpha = jnp.arange(1, self.order + 1)
         self.beta = self.alpha[::-1]
 
     def _forward(self, x: ArrayLike) -> Array:
-        x = jnp.clip(x, 1e-7, 1 - 1e-7)
-        bx = jax.vmap(beta_pdf, in_axes=(None, 0, 0), out_axes=-1)(x, self.alpha, self.beta)
-        return jnp.sum(self.thetas * bx, axis=-1)
-    
+        x = jnp.clip(x, 1e-6, 1 - 1e-6)
+        bx = beta_pdf(x[...,None], self.alpha, self.beta)
+        return jnp.mean(self.thetas * bx, axis=-1)
     
     def _inverse(self, y):
-        y = jnp.asarray(y)
-        batch_shape = self.thetas.shape[:-1]
         n_points = 100
-        clip = 1e-5
-        x_fit = jnp.linspace(clip, 1 - clip, n_points)[:,None]
+        clip = 1e-6
+        x_fit = jnp.linspace(clip, 1 - clip, n_points)
+        # x_fit *= jnp.ones((1, *y.shape))
         y_fit = self.forward(x_fit)
-
-        def inp(y, y_fit, x_fit):
-            return jnp.interp(y.ravel(), y_fit.ravel(), (x_fit * jnp.ones((1, *batch_shape))).ravel())
-
-        return inp(y, y_fit, x_fit).reshape(y.shape)
+        
+        def interp_fn(y, y_fit, x_fit):
+            return jnp.interp(y, y_fit, x_fit)
+        
+        # return jax.vmap(interp_fn, in_axes=-1, out_axes=-1)(y, y_fit, x_fit)
+        return interp_fn(y, y_fit, x_fit)
     
     def _forward_log_det_jacobian(self, x):
         """Computes log|det J(f)(x)|."""
-        x = jnp.clip(x, 1e-5, 1 - 1e-5)
-        dx_beta = jax.vmap(beta_pdf_derivative, in_axes=(None, 0, 0), out_axes=-1)(x, self.alpha, self.beta)
-        return jnp.log(jnp.abs(jnp.sum(self.thetas * dx_beta, axis=-1)))
+        x = jnp.clip(x, 1e-6, 1 - 1e-6)
+        by = beta_pdf(x[...,None], self.alpha[:-1], self.beta[1:])
+        dtheta = self.thetas[...,1:] - self.thetas[...,:-1]
+        return jnp.log(jnp.sum(by * dtheta, axis=-1))
+    
+    def forward_and_log_det(self, x: ArrayLike) -> tuple[Array, Array]:
+        y = self.forward(x)
+        logdet = self.forward_log_det_jacobian(x)
+        return y, logdet
+         
+    def inverse_and_log_det(self, y):
+        """Computes y = f(x) and log|det J(f)(x)|."""
+        y = self.inverse(y)
+        logdet = 0
+        return y, logdet
+    
+    def inverse_log_det_jacobian(self, y: ArrayLike) -> Array:
+        return 0
     
     @staticmethod
-    def constrain_thetas(thetas):
-        return jnp.cumsum(jax.nn.softplus(thetas), axis=-1)
-
+    def constrain_thetas(theta):
+        d = jnp.concatenate(
+            (
+                jnp.zeros_like(theta[...,:1]),
+                theta[...,:1],
+                jax.nn.softplus(theta[...,1:]) + 1e-4,
+            ),
+            axis=-1,
+        )
+        return jnp.cumsum(d[...,1:], axis=-1)
 
     def __repr__(self) -> str:
         return f"Bernstein(thetas={self.thetas})"
+    
     
 class Softclip(Bijector):
     """A softclip bijector.
@@ -127,36 +151,83 @@ class Softclip(Bijector):
     where softplus(x) = log(1 + exp(x)).
     """
 
-    def __init__(self, low: float=0.0, high=1.0, hinge_softness: float | None = None):
+    def __init__(self, low: float|None=None, high:float|None=None, hinge_softness: float | None = None):
         """Initializes the bijector.
 
         Args:
             low: The lower bound of the softclip function.
             high: The upper bound of the softclip function.
         """
-        self.low = low
-        self.high = high
-        self.softplus_bj = Softplus(hinge_softness=hinge_softness)
+        softplus_bj = Softplus(hinge_softness=hinge_softness)
 
+        components = []
+
+        if low is not None and high is not None:
+
+            width = high - low
+            components = [
+                Shift(high),
+                Scale(-width / (softplus_bj.forward(width))),
+                softplus_bj,
+                Shift(width),
+                Scale(-1.0),
+                softplus_bj,
+                Shift(-low),
+            ]
+        
+        elif low is not None:
+
+            components = [Shift(low), softplus_bj, Shift(-low)]
+
+        elif high is not None:
+                
+            components = [Shift(high), Scale(-1.0), softplus_bj, Scale(-1.0), Shift(-high)]
+
+        self._low = low
+        self._high = high
+        self._hinge_softness = hinge_softness
+        self._chain = Chain(components)
+    
+    # def _forward(self, x):
+    #     hl = self.high - self.low
+    #     _softplus = self.softplus_bj.forward 
+    #     return - _softplus(hl - _softplus(x - self.low)) * hl / _softplus(hl) + self.high
+
+    
+    # def _inverse(self, y):
+    #     l, h = self.low, self.high
+    #     _softplus = self.softplus_bj.forward
+    #     _softplus_inverse = self.softplus_bj.inverse
+    #     inner_term = (h - y) * _softplus(h - l) / (h - l)
+    #     return _softplus_inverse(h - l - _softplus_inverse(inner_term + l)) + l
+    #     # return _softplus_inverse(h - l - _softplus_inverse(inner_term)) + l
+    
+    
+    # def _forward_log_det_jacobian(self, x):
+    #     return jnp.log(jnp.abs(softclip_derivative(x, self.low, self.high, self.hinge_softness)))
+    
     def _forward(self, x):
-        hl = self.high - self.low
-        _softplus = self.softplus_bj.forward 
-        return - _softplus(hl - _softplus(x - self.low)) * hl / _softplus(hl) + self.high
-
+        return self._chain.forward(x)
     
     def _inverse(self, y):
-        l, h = self.low, self.high
-        _softplus = self.softplus_bj.forward
-        _softplus_inverse = self.softplus_bj.inverse
-        inner_term = (h - y) * _softplus(h - l) / (h - l)
-        return _softplus_inverse(h - l - _softplus_inverse(inner_term)) + l
+        return self._chain.inverse(y)
     
     def _forward_log_det_jacobian(self, x):
-        return jnp.log(jnp.abs(softclip_derivative(x, self.low, self.high)))
+        return self._chain.forward_log_det_jacobian(x)
     
     def __repr__(self) -> str:
-        return f"Softclip(low={self.low}, high={self.high})"
+        return f"Softclip(low={self._low}, high={self._high})"
     
+    
+def softclip_derivative(x, low, high, c):
+    c = c or 1.0
+    exp_part_x = jnp.exp((x - low) / c)
+    log_part = jnp.log(1 + exp_part_x)
+    exp_part_hl = jnp.exp((high - low) / c)
+    numerator_exp = jnp.exp(((-low + x) / c) + ((high - low - c * log_part) / c))
+    denominator = c * (1 + exp_part_x) * (1 + jnp.exp((high - low - c * log_part) / c)) * jnp.log(1 + exp_part_hl)
+    return (numerator_exp * (high - low)) / denominator
+
 
 class Softplus(Bijector):
     """A softplus bijector.
@@ -191,16 +262,16 @@ class Softplus(Bijector):
         return self.hinge_softness * inverse_softplus(y / self.hinge_softness)
     
     def _forward_log_det_jacobian(self, x):
-        if self.hinge_softness is None:
+        if self.hinge_softness is not None:
             x /= self.hinge_softness
         return - jax.nn.softplus(-x)
     
     def inverse_log_det_jacobian(self, y) -> Array:
         """Computes log|det J(f^{-1})(y)|."""
         y = y - self.low if self.low is not None else y
-        if self.hinge_softness is None:
+        if self.hinge_softness is not None:
             y /= self.hinge_softness
-        return - jax.nn.softplus(-y)
+        return -jnp.log(-jnp.expm1(-y))
     
     def __repr__(self) -> str:
         return f"Softplus(hinge_softness={self.hinge_softness}, low={self.low})"
@@ -297,7 +368,7 @@ class Chain(Bijector):
     
     def _forward_log_det_jacobian(self, x):
         fldj = jnp.zeros_like(x)
-        for bijector in self.bijectors:
+        for bijector in self.bijectors[::-1]:
             fldj += bijector.forward_log_det_jacobian(x)
             x = bijector.forward(x)
         return fldj
@@ -305,7 +376,7 @@ class Chain(Bijector):
     def inverse_log_det_jacobian(self, y):
         """Computes log|det J(f^{-1})(y)|."""
         ildj = jnp.zeros_like(y)
-        for bijector in self.bijectors[::-1]:
+        for bijector in self.bijectors:
             ildj += bijector.inverse_log_det_jacobian(y)
             y = bijector.inverse(y)
         return ildj
@@ -349,8 +420,11 @@ class Invert(Bijector):
 def softplus(x):
     return jnp.log(1 + jnp.exp(x))
 
+# def inverse_softplus(x):
+#     return jnp.log(-jnp.expm1(-x)) + x
+
 def inverse_softplus(x):
-    return jnp.log(jnp.exp(x) - 1)
+    return jnp.log(jnp.expm1(x))
 
 def softplus_derivative(x):
     expx = jnp.exp(x)
@@ -368,11 +442,11 @@ def inverse_softclip(z, low=0.0, high=1.0):
     inner_term = (high - z) * softplus(hl) / hl
     return inverse_softplus(high - low - inverse_softplus(inner_term)) + low
 
-def softclip_derivative(x, low=0.0, high=1.0):
-    hl = high - low
-    numerator = hl * jnp.exp(high - 2*low + x)
-    denominator = (jnp.exp(-low + x) + 1) * (jnp.exp(hl) + jnp.exp(-low + x) + 1) * jnp.log(jnp.exp(hl) + 1)
-    return numerator / denominator
+# def softclip_derivative(x, low=0.0, high=1.0):
+#     hl = high - low
+#     numerator = hl * jnp.exp(high - 2*low + x)
+#     denominator = (jnp.exp(-low + x) + 1) * (jnp.exp(hl) + jnp.exp(-low + x) + 1) * jnp.log(jnp.exp(hl) + 1)
+#     return numerator / denominator
 
 # ----------------------------------------
 # Beta distribution (needed for Bernstein bijector)
@@ -383,7 +457,6 @@ def beta_function(alpha, beta):
 def beta_pdf(x, alpha, beta):
     alpha, beta = map(jnp.asarray, (alpha, beta))
     B = beta_function(alpha, beta)
-    print(B.shape, x.shape, alpha.shape, beta.shape)
     return x**(alpha - 1) * (1 - x)**(beta - 1) / B
 
 def beta_pdf_derivative(x, alpha, beta):

@@ -6,7 +6,6 @@ from jax import Array
 from jax.typing import ArrayLike
 
 from .bijectors import Bernstein, Scale, Shift, Softclip, Chain, Invert
-from .transform import softplus
 from .distributions import StandardNormal
 
 class BernsteinFlow:
@@ -31,13 +30,14 @@ class BernsteinFlow:
                 are constrained to be monotonically increasing.
         
         """
-
+        self.batch_shape = params.shape[:-1]
         self.bijector = Invert(
             Chain(
-                [
+                [   
+                    Invert(Softclip(low=0., hinge_softness=3.0)),
                     Scale(jax.nn.softplus(params[...,0])),
                     Shift(params[...,1]),
-                    Softclip(low=0 + 1e-6, high=1 - 1e-6, hinge_softness=1.5),
+                    Softclip(low=0 + 1e-4, high=1 - 1e-4, hinge_softness=1.5),
                     Bernstein(params[...,2:-2], constrained=constrained),
                     Scale(jax.nn.softplus(params[...,-2])),
                     Shift(params[...,-1]),
@@ -54,7 +54,7 @@ class BernsteinFlow:
             key: A PRNG key.
             num_samples: The number of samples to generate.
         """
-        return self.bijector.forward(self.base_dist.sample(key, (num_samples,)))
+        return self.bijector.forward(self.base_dist.sample(key, (num_samples, *self.batch_shape)))
     
     def log_prob(self, value: ArrayLike):
         """Computes the log probability of the complex distribution.
